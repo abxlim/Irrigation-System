@@ -1,0 +1,715 @@
+/*==========================  KONFIG BLYNK  ==========================*/
+#define BLYNK_TEMPLATE_ID   "TMPL6AUPp-seV"
+#define BLYNK_TEMPLATE_NAME "Monitoring Final"
+#define BLYNK_AUTH_TOKEN    "Z1-YOslPVa80Qb1SlbjRwBiQu57RztpG"
+
+/*==========================  LIBRARY  ===============================*/
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+/*==========================  LCD & PIN  =============================*/
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+#define DHTPIN        5
+#define DHTTYPE       DHT11
+#define LED_AUTO      33
+#define LED_MANUAL    32
+#define MODE_BTN      26
+#define BACK_BTN      27
+#define UP_BTN        13
+#define DOWN_BTN      12
+#define OK_BTN        14
+#define RELAY_POMPA1  15
+#define RELAY_MANUAL  19  // indikator mode manual
+#define BTN_MANUAL    25  // tombol toggle pompa manual
+
+/*==========================  EEPROM MAP  ============================*/
+#define ADDR_KALIBSUHU   0
+#define ADDR_BATASSUHU   4
+#define ADDR_JADWALJAM   10   // int[2]
+#define ADDR_JADWALMENIT 20   // int[2]
+#define ADDR_DURASI      30   // int[2]
+#define ADDR_PASSWORD    40   // int[4]
+
+/*==========================  WIFI / BLYNK  ==========================*/
+const char* ssid = "Ws-Eletronika";
+const char* pass = "@bpvppdg25";
+const char* auth = BLYNK_AUTH_TOKEN;
+
+/*==========================  NTP & RTC  =============================*/
+RTC_DS3231 rtc;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000); // WIB, update per 60s
+bool synced = false;
+
+/*==========================  SENSOR & STATE  ========================*/
+DHT dht(DHTPIN, DHTTYPE);
+
+float T = NAN;                 // suhu terbaca
+int   kalibSuhu = 0;           // ± kalibrasi suhu (derajat C, 2 digit)
+int   batasSuhu = 28;          // batas suhu
+
+// Jadwal P1
+int jadwalJam[2]    = { 8, 20 };
+int jadwalMenit[2]  = { 0, 0 };
+int durasiMenit[2]  = { 1, 1 };
+bool relayOn[2]     = { false, false };
+unsigned long relayStartMillis[2] = {0, 0};
+
+// Password
+int password[4] = {1,2,3,4};
+int inputBuffer[4] = {0,0,0,0};
+
+// Mode, flags
+bool modeManual   = false;
+bool pompaManual  = false;
+
+// Blink & UI flags
+bool inMenu = false;
+bool inCekSuhu = false;
+bool inKalibSuhu = false;
+bool inSetBatasSuhu = false;
+bool inputPassword = false;
+
+const char* menuItems[8] = {
+  "Cek Suhu", "Kalib Suhu", "Set Batas Suhu", "Waktu (RTC)",
+  "Kalib RTC", "Set Jadwal P1", "Set Password", "Upload Program"
+};
+int curMenu = 0;
+
+// Blink cursor
+bool blinkState = false;
+unsigned long lastBlinkTime = 0;
+const unsigned long blinkInterval = 500;
+
+/*==========================  HELPER TIMER PESAN  ====================*/
+String msgLine0, msgLine1;
+unsigned long msgUntil = 0;
+bool showingMsg = false;
+
+void showMessage(const String& l0, const String& l1, unsigned long durMs) {
+  msgLine0 = l0; msgLine1 = l1;
+  msgUntil = millis() + durMs;
+  showingMsg = true;
+  lcd.clear();
+  lcd.setCursor(0,0); lcd.print(msgLine0);
+  lcd.setCursor(0,1); lcd.print(msgLine1);
+}
+void tickMessage() {
+  if (showingMsg && millis() > msgUntil) {
+    showingMsg = false;
+    lcd.clear();
+  }
+}
+
+/*==========================  DEBOUNCER TOMBOL  ======================*/
+struct ButtonDebounce {
+  uint8_t pin;
+  bool stable = HIGH;   // INPUT_PULLUP, HIGH = idle
+  bool lastRead = HIGH;
+  unsigned long lastChange = 0;
+  const unsigned long debounceMs = 50;
+  bool lastEdgeFell = false;
+  bool lastEdgeRose = false;
+
+  void begin(uint8_t p) {
+    pin = p;
+    pinMode(pin, INPUT_PULLUP);
+    stable = digitalRead(pin);
+    lastRead = stable;
+    lastChange = millis();
+  }
+  void update() {
+    lastEdgeFell = lastEdgeRose = false;
+    bool r = digitalRead(pin);
+    unsigned long now = millis();
+    if (r != lastRead) {
+      lastRead = r;
+      lastChange = now;
+    }
+    if (now - lastChange >= debounceMs) {
+      if (stable != r) {
+        lastEdgeFell = (stable == HIGH && r == LOW);
+        lastEdgeRose = (stable == LOW  && r == HIGH);
+        stable = r;
+      }
+    }
+  }
+  bool fell() { update(); return lastEdgeFell; }
+  bool rose() { update(); return lastEdgeRose; }
+};
+
+ButtonDebounce BTN_MODE, BTN_BACK, BTN_UP, BTN_DOWN, BTN_OK, BTN_MANUAL_PHYS;
+void initButtons() {
+  BTN_MODE.begin(MODE_BTN);
+  BTN_BACK.begin(BACK_BTN);
+  BTN_UP.begin(UP_BTN);
+  BTN_DOWN.begin(DOWN_BTN);
+  BTN_OK.begin(OK_BTN);
+  BTN_MANUAL_PHYS.begin(BTN_MANUAL);
+}
+
+/*==========================  EEPROM I/O  ============================*/
+void saveSettings() {
+  EEPROM.put(ADDR_KALIBSUHU, kalibSuhu);
+  EEPROM.put(ADDR_BATASSUHU, batasSuhu);
+  EEPROM.put(ADDR_JADWALJAM, jadwalJam);
+  EEPROM.put(ADDR_JADWALMENIT, jadwalMenit);
+  EEPROM.put(ADDR_DURASI, durasiMenit);
+  EEPROM.put(ADDR_PASSWORD, password);
+  EEPROM.commit();
+}
+void loadSettings() {
+  EEPROM.get(ADDR_KALIBSUHU, kalibSuhu);
+  EEPROM.get(ADDR_BATASSUHU, batasSuhu);
+  EEPROM.get(ADDR_JADWALJAM, jadwalJam);
+  EEPROM.get(ADDR_JADWALMENIT, jadwalMenit);
+  EEPROM.get(ADDR_DURASI, durasiMenit);
+  EEPROM.get(ADDR_PASSWORD, password);
+
+  if (batasSuhu <= 0 || batasSuhu > 99) batasSuhu = 28;
+  if (kalibSuhu < -50 || kalibSuhu > 50) kalibSuhu = 0;
+  for (int i=0;i<2;i++){
+    if (jadwalJam[i]   < 0 || jadwalJam[i]   > 23) jadwalJam[i]   = (i==0?8:20);
+    if (jadwalMenit[i] < 0 || jadwalMenit[i] > 59) jadwalMenit[i] = 0;
+    if (durasiMenit[i] <=0 || durasiMenit[i] > 59) durasiMenit[i] = 1;
+  }
+  for (int i=0;i<4;i++){
+    if (password[i] < 0 || password[i] > 9) password[i] = i+1;
+  }
+}
+
+/*==========================  WIFI/BLYNK RECONN  =====================*/
+unsigned long lastWifiTry  = 0;
+unsigned long lastBlynkTry = 0;
+void tryReconnectWiFi() {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWifiTry > 5000) {
+    lastWifiTry = millis();
+    WiFi.disconnect(true);
+    WiFi.begin(ssid, pass);
+  }
+}
+void tryReconnectBlynk() {
+  if (WiFi.status() == WL_CONNECTED && !Blynk.connected() && millis() - lastBlynkTry > 3000) {
+    lastBlynkTry = millis();
+    Blynk.connect();
+  }
+}
+
+/*==========================  HEMAT KUOTA BLYNK  =====================*/
+// Throttle & edge-send
+unsigned long lastSendTempMs = 0;
+const unsigned long tempSendEveryMs = 5000; // 5 detik
+float lastSentTemp = NAN;
+
+void sendTempIfNeeded(float tempC) {
+  unsigned long now = millis();
+  if (now - lastSendTempMs < tempSendEveryMs) return;
+  if (isnan(tempC)) return;
+  if (isnan(lastSentTemp) || fabs(tempC - lastSentTemp) >= 0.3f) {
+    if (Blynk.connected()) {
+      Blynk.virtualWrite(V1, tempC);
+      lastSentTemp = tempC;
+      lastSendTempMs = now;
+    }
+  } else {
+    lastSendTempMs = now; // tetap throttle walau tidak kirim
+  }
+}
+
+bool lastSentModeManual = false;
+void sendModeIfChanged(bool mm) {
+  if (mm != lastSentModeManual) {
+    if (Blynk.connected()) Blynk.virtualWrite(V0, mm ? 1 : 0);
+    lastSentModeManual = mm;
+  }
+}
+
+bool lastSentPompa = false;
+void sendPompaIfChanged(bool pm) {
+  if (pm != lastSentPompa) {
+    if (Blynk.connected()) Blynk.virtualWrite(V2, pm ? 1 : 0);
+    lastSentPompa = pm;
+  }
+}
+
+/*==========================  BLYNK VIRTUAL PINS  ====================*/
+// Mode Auto/Manual
+BLYNK_WRITE(V0) {
+  int v = param.asInt();
+  modeManual = (v != 0);
+  digitalWrite(LED_AUTO, !modeManual);
+  digitalWrite(LED_MANUAL, modeManual);
+  digitalWrite(RELAY_MANUAL, modeManual ? LOW : HIGH);
+  sendModeIfChanged(modeManual);           // kirim hanya saat berubah
+}
+
+// Pompa manual
+BLYNK_WRITE(V2) {
+  int v = param.asInt();
+  pompaManual = (v != 0);
+  sendPompaIfChanged(pompaManual);
+  if (modeManual) {
+    digitalWrite(RELAY_POMPA1, pompaManual ? HIGH : LOW);
+  }
+}
+
+/*==========================  NTP SYNC (NONBLOCK)  ===================*/
+unsigned long lastNtpCheck = 0;
+const unsigned long ntpCheckInterval = 5000;
+void syncRTCwithNTP() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastNtpCheck >= ntpCheckInterval) {
+    lastNtpCheck = nowMs;
+    timeClient.update();
+    if (!synced) {
+      unsigned long epoch = timeClient.getEpochTime();
+      if (epoch > 100000) {
+        rtc.adjust(DateTime(epoch));
+        synced = true;
+      }
+    }
+  }
+}
+
+/*==========================  RELAY & JADWAL  ========================*/
+void updateJadwalP1() {
+  DateTime now = rtc.now();
+  for (int i=0;i<2;i++){
+    if (!relayOn[i] && now.hour()==jadwalJam[i] && now.minute()==jadwalMenit[i]) {
+      relayOn[i] = true;
+      relayStartMillis[i] = millis();
+    }
+  }
+  for (int i=0;i<2;i++){
+    if (relayOn[i]) {
+      unsigned long elapsed = millis() - relayStartMillis[i];
+      if (elapsed >= (unsigned long)durasiMenit[i] * 60000UL) {
+        relayOn[i] = false;
+      }
+    }
+  }
+}
+
+void updateRelayAndLed() {
+  digitalWrite(LED_AUTO, !modeManual);
+  digitalWrite(LED_MANUAL, modeManual);
+
+  // logika suhu di-nonaktifkan (hanya jadwal). Jika mau aktifkan batas suhu, gabung OR dengan relaySuhu.
+  bool relayJadwal = (relayOn[0] || relayOn[1]);
+
+  if (!modeManual) {
+    digitalWrite(RELAY_POMPA1, relayJadwal ? HIGH : LOW);
+  } else {
+    // manual: di-handle oleh kondisiManual()
+  }
+}
+
+void kondisiManual() {
+  if (modeManual) {
+    digitalWrite(RELAY_MANUAL, LOW);
+    // toggle pompa dari tombol fisik
+    if (BTN_MANUAL_PHYS.fell()) {
+      pompaManual = !pompaManual;
+      sendPompaIfChanged(pompaManual);         // update ke Blynk hemat
+    }
+    digitalWrite(RELAY_POMPA1, pompaManual ? HIGH : LOW);
+  } else {
+    digitalWrite(RELAY_MANUAL, HIGH);
+    if (pompaManual) { pompaManual = false; sendPompaIfChanged(false); }
+  }
+}
+
+/*==========================  STATE MACHINE MENU  ====================*/
+// Jadwal P1 editor
+enum JadwalState { J_IDLE, J_EDIT };
+JadwalState jState = J_IDLE;
+int j_curJadwal = 0;    // 0/1
+int j_curDigit = 0;     // 0=jam,1=menit,2=durasi
+unsigned long j_lastBlink = 0;
+bool j_blink = false;
+
+void startMenuSetJadwalP1(){
+  jState = J_EDIT;
+  j_curJadwal = 0;
+  j_curDigit = 0;
+  j_lastBlink = millis();
+  j_blink = false;
+  lcd.clear();
+}
+
+void tickMenuSetJadwalP1(){
+  if (jState != J_EDIT) return;
+
+  unsigned long now = millis();
+  if (now - j_lastBlink >= blinkInterval) { j_lastBlink = now; j_blink = !j_blink; }
+
+  lcd.setCursor(0,0); lcd.print("Set Jadwal P1:  ");
+  lcd.setCursor(0,1);
+  lcd.print(j_curJadwal==0 ? "Jadwal1: " : "Jadwal2: ");
+
+  // jam
+  if (j_curDigit==0 && j_blink) lcd.print("__");
+  else { if (jadwalJam[j_curJadwal]<10) lcd.print('0'); lcd.print(jadwalJam[j_curJadwal]); }
+  lcd.print(':');
+  // menit
+  if (j_curDigit==1 && j_blink) lcd.print("__");
+  else { if (jadwalMenit[j_curJadwal]<10) lcd.print('0'); lcd.print(jadwalMenit[j_curJadwal]); }
+  lcd.print(' ');
+  // durasi
+  if (j_curDigit==2 && j_blink) lcd.print("__");
+  else { if (durasiMenit[j_curJadwal]<10) lcd.print(' '); lcd.print(durasiMenit[j_curJadwal]); }
+  lcd.print(" ");
+
+  if (BTN_UP.fell()) {
+    if (j_curDigit==0) jadwalJam[j_curJadwal]   = (jadwalJam[j_curJadwal]+1) % 24;
+    else if (j_curDigit==1) jadwalMenit[j_curJadwal] = (jadwalMenit[j_curJadwal]+1) % 60;
+    else { durasiMenit[j_curJadwal]++; if (durasiMenit[j_curJadwal]>59) durasiMenit[j_curJadwal]=1; }
+  }
+  if (BTN_DOWN.fell()) {
+    if (j_curDigit==0) jadwalJam[j_curJadwal]   = (jadwalJam[j_curJadwal]+23) % 24;
+    else if (j_curDigit==1) jadwalMenit[j_curJadwal] = (jadwalMenit[j_curJadwal]+59) % 60;
+    else { durasiMenit[j_curJadwal]--; if (durasiMenit[j_curJadwal]<1) durasiMenit[j_curJadwal]=1; }
+  }
+  if (BTN_OK.fell()) {
+    j_curDigit++;
+    if (j_curDigit>2) {
+      j_curDigit=0; j_curJadwal++;
+      if (j_curJadwal>1) { jState = J_IDLE; showMessage("Jadwal Tersimpan","",600); }
+    }
+  }
+  if (BTN_BACK.fell()) { jState = J_IDLE; showMessage("Batal","",400); }
+}
+
+// Kalibrasi suhu
+int curDigit = 0;  // share untuk sub-menu
+void tickKalibSuhu(){
+  if (!inKalibSuhu) return;
+
+  if (millis()-lastBlinkTime >= blinkInterval) {
+    lastBlinkTime = millis();
+    blinkState = !blinkState;
+
+    int absVal = abs(kalibSuhu);
+    int puluhan = absVal/10;
+    int satuan  = absVal%10;
+
+    lcd.setCursor(0,0); lcd.print("Kalib Suhu:     ");
+    lcd.setCursor(0,1);
+    lcd.print((curDigit==0 && blinkState) ? '_' : (kalibSuhu<0 ? '-' : '+'));
+    lcd.setCursor(1,1); lcd.print((curDigit==1 && blinkState) ? '_' : char('0'+puluhan));
+    lcd.setCursor(2,1); lcd.print((curDigit==2 && blinkState) ? '_' : char('0'+satuan));
+  }
+
+  if (BTN_UP.fell() || BTN_DOWN.fell()) {
+    bool up = BTN_UP.fell();
+    int absVal = abs(kalibSuhu);
+    int puluhan = absVal/10;
+    int satuan  = absVal%10;
+
+    if (curDigit==0) kalibSuhu = -kalibSuhu;
+    else if (curDigit==1) { puluhan = (puluhan + (up?1:9))%10; kalibSuhu = (kalibSuhu<0?-1:1)*(puluhan*10+satuan); }
+    else { satuan = (satuan + (up?1:9))%10; kalibSuhu = (kalibSuhu<0?-1:1)*(puluhan*10+satuan); }
+  }
+  if (BTN_OK.fell()) { curDigit++; if (curDigit>2){ inKalibSuhu=false; showMessage("Simpan OK","",500);} }
+  if (BTN_BACK.fell()) { inKalibSuhu=false; showMessage("Batal","",400); }
+}
+
+// Set Batas Suhu
+int batasBuffer[2] = {2,8};
+void tickSetBatasSuhu(){
+  if (!inSetBatasSuhu) return;
+
+  if (millis()-lastBlinkTime >= blinkInterval) {
+    lastBlinkTime = millis(); blinkState = !blinkState;
+    lcd.setCursor(0,0); lcd.print("Set Batas Suhu: ");
+    lcd.setCursor(0,1);
+    for (int i=0;i<2;i++){
+      if (i==curDigit && blinkState) lcd.print('_');
+      else lcd.print(batasBuffer[i]);
+    }
+    lcd.print("        ");
+  }
+  if (BTN_UP.fell())   { batasBuffer[curDigit] = (batasBuffer[curDigit]+1)%10; }
+  if (BTN_DOWN.fell()) { batasBuffer[curDigit] = (batasBuffer[curDigit]+9)%10; }
+  if (BTN_OK.fell()) {
+    curDigit++;
+    if (curDigit>1){
+      inSetBatasSuhu=false;
+      batasSuhu = batasBuffer[0]*10 + batasBuffer[1];
+      showMessage("Simpan OK","",500);
+    }
+  }
+  if (BTN_BACK.fell()) { inSetBatasSuhu=false; showMessage("Batal","",400); }
+}
+
+// Upload program anim (non-block)
+enum UploadState { U_IDLE, U_RUN, U_DONE };
+UploadState uState = U_IDLE;
+unsigned long uLast = 0; int uStep = 0;
+void startUploadAnim(){ uState=U_RUN; uStep=0; uLast=millis(); lcd.clear(); lcd.setCursor(0,0); lcd.print("Upload Program"); }
+void tickUploadAnim(){
+  if (uState!=U_RUN) return;
+  if (millis()-uLast >= 500){
+    uLast = millis(); uStep++;
+    lcd.setCursor(0,1); lcd.print("                ");
+    lcd.setCursor(0,1);
+    for (int i=0;i<uStep && i<16;i++) lcd.print('.');
+    if (uStep>=4) { saveSettings(); showMessage("Upload Berhasil","",1500); uState=U_DONE; }
+  }
+}
+
+/*==========================  SETUP  =================================*/
+bool flag = false; // untuk transisi koneksi
+void setup() {
+  lcd.init(); lcd.backlight();
+  EEPROM.begin(512);
+  loadSettings();
+  dht.begin();
+  if (!rtc.begin()) {
+    lcd.setCursor(0,0); lcd.print("RTC Error!");
+    while(1);
+  }
+
+  pinMode(LED_AUTO, OUTPUT);
+  pinMode(LED_MANUAL, OUTPUT);
+  pinMode(RELAY_POMPA1, OUTPUT);
+  pinMode(RELAY_MANUAL, OUTPUT);
+  digitalWrite(RELAY_MANUAL, HIGH);
+
+  initButtons();
+
+  WiFi.begin(ssid, pass);
+  Blynk.config(auth);
+  unsigned long t0 = millis();
+  while (millis()-t0 < 3000 && WiFi.status()!=WL_CONNECTED) { /* non-blocking-ish */ }
+  if (WiFi.status()==WL_CONNECTED) Blynk.connect(2000);
+  timeClient.begin();
+
+  // sinkron awal tampilan
+  lcd.setCursor(0,0); lcd.print(" SISTEM START  ");
+  lcd.setCursor(0,1); lcd.print("   Loading...  ");
+}
+
+/*==========================  LAYAR UTAMA  ===========================*/
+void drawHome() {
+  float displayT = (isnan(T) ? NAN : T + kalibSuhu);
+  DateTime now = rtc.now();
+
+  lcd.setCursor(0,0); lcd.print("T:");
+  if (isnan(displayT)) lcd.print("Err ");
+  else {
+    // Cetak suhu dengan 1 desimal agar stabil
+    char buf[6];
+    dtostrf(displayT, 4, 1, buf); // "_ _._"
+    lcd.print(buf);
+  }
+  lcd.print((char)223); lcd.print("C ");
+  lcd.setCursor(10,0); lcd.print(modeManual ? "Manual" : "  Auto");
+
+  lcd.setCursor(0,1);
+  if (now.day() < 10) lcd.print('0'); lcd.print(now.day());
+  lcd.print('/');
+  if (now.month() < 10) lcd.print('0'); lcd.print(now.month());
+  lcd.print("   ");
+  if (now.hour() < 10) lcd.print('0'); lcd.print(now.hour());
+  lcd.print(':');
+  if (now.minute() < 10) lcd.print('0'); lcd.print(now.minute());
+  lcd.print(':');
+  if (now.second() < 10) lcd.print('0'); lcd.print(now.second());
+}
+
+/*==========================  LOOP  ==================================*/
+unsigned long lastHomeDraw = 0;
+void loop() {
+  tryReconnectWiFi();
+  tryReconnectBlynk();
+
+  if (WiFi.status()==WL_CONNECTED && Blynk.connected()) {
+    syncRTCwithNTP();
+    if (!flag) {
+      // sinkron tombol mode sekali saat konek
+      sendModeIfChanged(modeManual);
+      lcd.init(); lcd.backlight();
+      inMenu = false;
+      flag = true;
+    }
+    Blynk.run();
+  } else {
+    if (flag) {
+      lcd.init(); lcd.backlight();
+      inMenu = false;
+      flag = false;
+    }
+    synced = false;
+  }
+
+  // ==== Baca tombol mode (hemat kuota: kirim hanya saat berubah)
+  if (BTN_MODE.fell()) {
+    modeManual = !modeManual;
+    digitalWrite(LED_AUTO, !modeManual);
+    digitalWrite(LED_MANUAL, modeManual);
+    digitalWrite(RELAY_MANUAL, modeManual ? LOW : HIGH);
+    sendModeIfChanged(modeManual);
+    if (!modeManual) { pompaManual = false; sendPompaIfChanged(false); }
+  }
+
+  // ==== Sensor & Jadwal & Relay
+  static unsigned long lastReadT = 0;
+  if (millis() - lastReadT >= 1000) {
+    lastReadT = millis();
+    T = dht.readTemperature(); // bisa NaN
+    updateJadwalP1();
+    updateRelayAndLed();
+    kondisiManual();
+
+    // kirim suhu hemat (throttle + delta)
+    float displayT = (isnan(T) ? NAN : T + kalibSuhu);
+    sendTempIfNeeded(displayT);
+  }
+
+  // ==== Menu & UI (ringan)
+  // tombol BACK saat layar utama -> minta password
+  if (!inMenu && !inputPassword && !inCekSuhu && !inKalibSuhu && !inSetBatasSuhu && jState==J_IDLE && uState!=U_RUN) {
+    if (BTN_BACK.fell()) {
+      inputPassword = true;
+      curDigit = 0;
+      for (int i=0;i<4;i++) inputBuffer[i]=0;
+      lcd.clear();
+      lcd.setCursor(0,0); lcd.print("Password:");
+      for (int i=0;i<4;i++){ lcd.setCursor(i*2,1); lcd.print(inputBuffer[i]); }
+      lastBlinkTime = millis();
+    }
+  }
+
+  // Input Password
+  if (inputPassword) {
+    if (millis()-lastBlinkTime >= blinkInterval) {
+      lastBlinkTime = millis(); blinkState = !blinkState;
+      lcd.setCursor(curDigit*2,1);
+      lcd.print(blinkState ? '_' : char('0'+inputBuffer[curDigit]));
+    }
+    if (BTN_UP.fell())   { inputBuffer[curDigit] = (inputBuffer[curDigit]+1)%10; lcd.setCursor(curDigit*2,1); lcd.print(inputBuffer[curDigit]); }
+    if (BTN_DOWN.fell()) { inputBuffer[curDigit] = (inputBuffer[curDigit]+9)%10; lcd.setCursor(curDigit*2,1); lcd.print(inputBuffer[curDigit]); }
+    if (BTN_OK.fell()) {
+      curDigit++;
+      if (curDigit>3) {
+        bool passOk = true; for (int i=0;i<4;i++) if (inputBuffer[i]!=password[i]) passOk=false;
+        lcd.clear(); lcd.setCursor(0,0);
+        if (passOk) {
+          lcd.print("Password OK"); inMenu=true; curMenu=0;
+          lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]);
+        } else {
+          lcd.print("Password Salah");
+          // reset input
+          for (int i=0;i<4;i++) inputBuffer[i]=0; curDigit=0;
+          lcd.clear(); lcd.setCursor(0,0); lcd.print("Password:");
+          for (int i=0;i<4;i++){ lcd.setCursor(i*2,1); lcd.print(inputBuffer[i]); }
+          lastBlinkTime = millis();
+          inputPassword = true; // tetap di mode input
+        }
+      }
+    }
+  }
+  else if (inMenu) {
+    // navigasi menu
+    if (!inCekSuhu && !inKalibSuhu && !inSetBatasSuhu && jState==J_IDLE && uState!=U_RUN) {
+      if (BTN_UP.fell())   { curMenu = (curMenu + 7) % 8; lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); }
+      if (BTN_DOWN.fell()) { curMenu = (curMenu + 1) % 8; lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); }
+      if (BTN_OK.fell()) {
+        if (curMenu==0) { inCekSuhu = true; lcd.clear(); }
+        else if (curMenu==1){ inKalibSuhu=true; curDigit=0; lcd.clear(); lcd.setCursor(0,0); lcd.print("Kalib Suhu:"); lastBlinkTime=millis(); }
+        else if (curMenu==2){ inSetBatasSuhu=true; curDigit=0; batasBuffer[0]=batasSuhu/10; batasBuffer[1]=batasSuhu%10; lcd.clear(); lcd.setCursor(0,0); lcd.print("Set Batas Suhu:"); lastBlinkTime=millis(); }
+        else if (curMenu==3){ // Waktu (RTC) viewer
+          lcd.clear();
+          // viewer non-block: cukup tampilkan pada loop home dengan refresh cepat
+          showMessage("Mode Waktu","Tekan BACK",1200);
+        }
+        else if (curMenu==4){ // Kalib RTC: izinkan kalau tidak ada WiFi agar manual
+          if (WiFi.status()!=WL_CONNECTED) {
+            // editor sederhana jam:menit:detik (bisa dikembangkan spt fungsi di atas)
+            DateTime now = rtc.now();
+            int jam=now.hour(), menit=now.minute(), detik=now.second();
+            int cur=0; lastBlinkTime=millis(); blinkState=false;
+            while (true) {
+              // nonblocking-ish kecil: keluar bila tombol BACK
+              // NB: loop pendek ini masih blocking; jika mau total non-block, pindah ke state machine seperti jadwal.
+              // Untuk singkatnya, tetap sediakan ini — tekan BACK untuk batal.
+              if (millis()-lastBlinkTime>=blinkInterval){lastBlinkTime=millis();blinkState=!blinkState;}
+              lcd.setCursor(0,0); lcd.print("Kalib RTC:      ");
+              lcd.setCursor(0,1);
+              if (cur==0 && blinkState) lcd.print("__"); else { if (jam<10) lcd.print('0'); lcd.print(jam); }
+              lcd.print(':');
+              if (cur==1 && blinkState) lcd.print("__"); else { if (menit<10) lcd.print('0'); lcd.print(menit); }
+              lcd.print(':');
+              if (cur==2 && blinkState) lcd.print("__"); else { if (detik<10) lcd.print('0'); lcd.print(detik); }
+              BTN_UP.update(); BTN_DOWN.update(); BTN_OK.update(); BTN_BACK.update();
+              if (BTN_UP.fell())   { if(cur==0){jam=(jam+1)%24;} else if(cur==1){menit=(menit+1)%60;} else {detik=(detik+1)%60;} }
+              if (BTN_DOWN.fell()) { if(cur==0){jam=(jam+23)%24;} else if(cur==1){menit=(menit+59)%60;} else {detik=(detik+59)%60;} }
+              if (BTN_OK.fell())   { cur++; if(cur>2){ rtc.adjust(DateTime(now.year(),now.month(),now.day(),jam,menit,detik)); showMessage("Simpan OK","",600); break; } }
+              if (BTN_BACK.fell()) { showMessage("Batal","",400); break; }
+              tryReconnectWiFi(); tryReconnectBlynk(); // supaya tetap responsif
+            }
+          } else {
+            showMessage("Terhubung WiFi","Kalib RTC manual OFF",1200);
+          }
+        }
+        else if (curMenu==5){ startMenuSetJadwalP1(); }
+        else if (curMenu==6){ // Set Password (sederhana)
+          lcd.clear();
+          int newPass[4]={0,0,0,0}; int p=0; lastBlinkTime=millis(); blinkState=false;
+          while(true){
+            if (millis()-lastBlinkTime>=blinkInterval){lastBlinkTime=millis();blinkState=!blinkState;}
+            lcd.setCursor(0,0); lcd.print("Set Password:   ");
+            for (int i=0;i<4;i++){ lcd.setCursor(i*2,1); if (i==p && blinkState) lcd.print('_'); else lcd.print(newPass[i]); }
+            BTN_UP.update(); BTN_DOWN.update(); BTN_OK.update(); BTN_BACK.update();
+            if (BTN_UP.fell())   { newPass[p]=(newPass[p]+1)%10; }
+            if (BTN_DOWN.fell()) { newPass[p]=(newPass[p]+9)%10; }
+            if (BTN_OK.fell())   { p++; if (p>3){ for (int i=0;i<4;i++) password[i]=newPass[i]; saveSettings(); showMessage("Password Save","",800); break; } }
+            if (BTN_BACK.fell()) { showMessage("Batal","",400); break; }
+            tryReconnectWiFi(); tryReconnectBlynk();
+          }
+        }
+        else if (curMenu==7){ startUploadAnim(); inMenu=false; } // keluar ke home saat upload
+      }
+      if (BTN_BACK.fell()) { inMenu=false; lcd.clear(); }
+    }
+
+    // Sub-menu Cek Suhu
+    if (inCekSuhu) {
+      float displayT = (isnan(T) ? NAN : T + kalibSuhu);
+      lcd.setCursor(0,0); lcd.print("Suhu: ");
+      if (isnan(displayT)) lcd.print("Err ");
+      else {
+        char buf[6]; dtostrf(displayT, 4,1, buf);
+        lcd.print(buf);
+      }
+      lcd.print((char)223); lcd.print("C   ");
+      lcd.setCursor(0,1); lcd.print("BACK utk keluar ");
+      if (BTN_BACK.fell()) { inCekSuhu=false; lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); }
+    }
+
+    // Sub-menu lain tick
+    if (inKalibSuhu)    tickKalibSuhu();
+    if (inSetBatasSuhu) tickSetBatasSuhu();
+    tickMenuSetJadwalP1();
+  }
+  else {
+    // Layar utama
+    if (!showingMsg && uState!=U_RUN && jState==J_IDLE && !inKalibSuhu && !inSetBatasSuhu && !inCekSuhu && !inputPassword) {
+      if (millis()-lastHomeDraw >= 200) { lastHomeDraw = millis(); drawHome(); }
+    }
+  }
+
+  // Animator upload
+  tickUploadAnim();
+  // Pesan sementara
+  tickMessage();
+}
