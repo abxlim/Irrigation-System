@@ -13,6 +13,7 @@
 #include <BlynkSimpleEsp32.h>
 #include <NTPClient.h>
 #include <WiFiUdp.h>
+#include <math.h>
 
 /*==========================  LCD & PIN  =============================*/
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -89,6 +90,12 @@ bool blinkState = false;
 unsigned long lastBlinkTime = 0;
 const unsigned long blinkInterval = 500;
 
+/*==========================  HELPER LCD  ============================*/
+void clearLine(uint8_t row) {
+  lcd.setCursor(0, row);
+  lcd.print("                "); // 16 spasi
+}
+
 /*==========================  HELPER TIMER PESAN  ====================*/
 String msgLine0, msgLine1;
 unsigned long msgUntil = 0;
@@ -99,8 +106,8 @@ void showMessage(const String& l0, const String& l1, unsigned long durMs) {
   msgUntil = millis() + durMs;
   showingMsg = true;
   lcd.clear();
-  lcd.setCursor(0,0); lcd.print(msgLine0);
-  lcd.setCursor(0,1); lcd.print(msgLine1);
+  clearLine(0); lcd.setCursor(0,0); lcd.print(msgLine0);
+  clearLine(1); lcd.setCursor(0,1); lcd.print(msgLine1);
 }
 void tickMessage() {
   if (showingMsg && millis() > msgUntil) {
@@ -217,11 +224,9 @@ void sendTempIfNeeded(float tempC) {
     if (Blynk.connected()) {
       Blynk.virtualWrite(V1, tempC);
       lastSentTemp = tempC;
-      lastSendTempMs = now;
     }
-  } else {
-    lastSendTempMs = now; // tetap throttle walau tidak kirim
   }
+  lastSendTempMs = now; // throttle window reset
 }
 
 bool lastSentModeManual = false;
@@ -302,23 +307,20 @@ void updateRelayAndLed() {
   digitalWrite(LED_AUTO, !modeManual);
   digitalWrite(LED_MANUAL, modeManual);
 
-  // logika suhu di-nonaktifkan (hanya jadwal). Jika mau aktifkan batas suhu, gabung OR dengan relaySuhu.
+  // Hanya jadwal. Jika mau gunakan batas suhu, OR-kan dengan (T+kalibSuhu >= batasSuhu)
   bool relayJadwal = (relayOn[0] || relayOn[1]);
 
   if (!modeManual) {
     digitalWrite(RELAY_POMPA1, relayJadwal ? HIGH : LOW);
-  } else {
-    // manual: di-handle oleh kondisiManual()
-  }
+  } // manual di-handle di kondisiManual()
 }
 
 void kondisiManual() {
   if (modeManual) {
     digitalWrite(RELAY_MANUAL, LOW);
-    // toggle pompa dari tombol fisik
     if (BTN_MANUAL_PHYS.fell()) {
       pompaManual = !pompaManual;
-      sendPompaIfChanged(pompaManual);         // update ke Blynk hemat
+      sendPompaIfChanged(pompaManual);
     }
     digitalWrite(RELAY_POMPA1, pompaManual ? HIGH : LOW);
   } else {
@@ -351,8 +353,8 @@ void tickMenuSetJadwalP1(){
   unsigned long now = millis();
   if (now - j_lastBlink >= blinkInterval) { j_lastBlink = now; j_blink = !j_blink; }
 
-  lcd.setCursor(0,0); lcd.print("Set Jadwal P1:  ");
-  lcd.setCursor(0,1);
+  clearLine(0); lcd.setCursor(0,0); lcd.print("Set Jadwal P1:  ");
+  clearLine(1); lcd.setCursor(0,1);
   lcd.print(j_curJadwal==0 ? "Jadwal1: " : "Jadwal2: ");
 
   // jam
@@ -366,7 +368,7 @@ void tickMenuSetJadwalP1(){
   // durasi
   if (j_curDigit==2 && j_blink) lcd.print("__");
   else { if (durasiMenit[j_curJadwal]<10) lcd.print(' '); lcd.print(durasiMenit[j_curJadwal]); }
-  lcd.print(" ");
+  lcd.print(' ');
 
   if (BTN_UP.fell()) {
     if (j_curDigit==0) jadwalJam[j_curJadwal]   = (jadwalJam[j_curJadwal]+1) % 24;
@@ -389,7 +391,7 @@ void tickMenuSetJadwalP1(){
 }
 
 // Kalibrasi suhu
-int curDigit = 0;  // share untuk sub-menu
+int curDigit = 0;  // share utk sub-menu
 void tickKalibSuhu(){
   if (!inKalibSuhu) return;
 
@@ -401,7 +403,8 @@ void tickKalibSuhu(){
     int puluhan = absVal/10;
     int satuan  = absVal%10;
 
-    lcd.setCursor(0,0); lcd.print("Kalib Suhu:     ");
+    clearLine(0); lcd.setCursor(0,0); lcd.print("Kalib Suhu:     ");
+    clearLine(1);
     lcd.setCursor(0,1);
     lcd.print((curDigit==0 && blinkState) ? '_' : (kalibSuhu<0 ? '-' : '+'));
     lcd.setCursor(1,1); lcd.print((curDigit==1 && blinkState) ? '_' : char('0'+puluhan));
@@ -429,8 +432,8 @@ void tickSetBatasSuhu(){
 
   if (millis()-lastBlinkTime >= blinkInterval) {
     lastBlinkTime = millis(); blinkState = !blinkState;
-    lcd.setCursor(0,0); lcd.print("Set Batas Suhu: ");
-    lcd.setCursor(0,1);
+    clearLine(0); lcd.setCursor(0,0); lcd.print("Set Batas Suhu: ");
+    clearLine(1); lcd.setCursor(0,1);
     for (int i=0;i<2;i++){
       if (i==curDigit && blinkState) lcd.print('_');
       else lcd.print(batasBuffer[i]);
@@ -454,27 +457,30 @@ void tickSetBatasSuhu(){
 enum UploadState { U_IDLE, U_RUN, U_DONE };
 UploadState uState = U_IDLE;
 unsigned long uLast = 0; int uStep = 0;
-void startUploadAnim(){ uState=U_RUN; uStep=0; uLast=millis(); lcd.clear(); lcd.setCursor(0,0); lcd.print("Upload Program"); }
+void startUploadAnim(){ uState=U_RUN; uStep=0; uLast=millis(); lcd.clear(); clearLine(0); lcd.setCursor(0,0); lcd.print("Upload Program"); }
 void tickUploadAnim(){
   if (uState!=U_RUN) return;
   if (millis()-uLast >= 500){
     uLast = millis(); uStep++;
-    lcd.setCursor(0,1); lcd.print("                ");
-    lcd.setCursor(0,1);
+    clearLine(1); lcd.setCursor(0,1);
     for (int i=0;i<uStep && i<16;i++) lcd.print('.');
-    if (uStep>=4) { saveSettings(); showMessage("Upload Berhasil","",1500); uState=U_DONE; }
+    if (uStep>=4) { saveSettings(); showMessage("Upload Berhasil","",1200); uState=U_DONE; }
   }
 }
 
 /*==========================  SETUP  =================================*/
 bool flag = false; // untuk transisi koneksi
+void initLcdSplash() {
+  clearLine(0); lcd.setCursor(0,0); lcd.print(" SISTEM START  ");
+  clearLine(1); lcd.setCursor(0,1); lcd.print("   Loading...  ");
+}
 void setup() {
   lcd.init(); lcd.backlight();
   EEPROM.begin(512);
   loadSettings();
   dht.begin();
   if (!rtc.begin()) {
-    lcd.setCursor(0,0); lcd.print("RTC Error!");
+    clearLine(0); lcd.setCursor(0,0); lcd.print("RTC Error!");
     while(1);
   }
 
@@ -489,13 +495,11 @@ void setup() {
   WiFi.begin(ssid, pass);
   Blynk.config(auth);
   unsigned long t0 = millis();
-  while (millis()-t0 < 3000 && WiFi.status()!=WL_CONNECTED) { /* non-blocking-ish */ }
+  while (millis()-t0 < 3000 && WiFi.status()!=WL_CONNECTED) { /* wait short */ }
   if (WiFi.status()==WL_CONNECTED) Blynk.connect(2000);
   timeClient.begin();
 
-  // sinkron awal tampilan
-  lcd.setCursor(0,0); lcd.print(" SISTEM START  ");
-  lcd.setCursor(0,1); lcd.print("   Loading...  ");
+  initLcdSplash();
 }
 
 /*==========================  LAYAR UTAMA  ===========================*/
@@ -503,10 +507,10 @@ void drawHome() {
   float displayT = (isnan(T) ? NAN : T + kalibSuhu);
   DateTime now = rtc.now();
 
+  clearLine(0);
   lcd.setCursor(0,0); lcd.print("T:");
   if (isnan(displayT)) lcd.print("Err ");
   else {
-    // Cetak suhu dengan 1 desimal agar stabil
     char buf[6];
     dtostrf(displayT, 4, 1, buf); // "_ _._"
     lcd.print(buf);
@@ -514,6 +518,7 @@ void drawHome() {
   lcd.print((char)223); lcd.print("C ");
   lcd.setCursor(10,0); lcd.print(modeManual ? "Manual" : "  Auto");
 
+  clearLine(1);
   lcd.setCursor(0,1);
   if (now.day() < 10) lcd.print('0'); lcd.print(now.day());
   lcd.print('/');
@@ -551,7 +556,7 @@ void loop() {
     synced = false;
   }
 
-  // ==== Baca tombol mode (hemat kuota: kirim hanya saat berubah)
+  // ==== Tombol MODE (toggle), tanpa sisa karakter di layar ====
   if (BTN_MODE.fell()) {
     modeManual = !modeManual;
     digitalWrite(LED_AUTO, !modeManual);
@@ -575,76 +580,89 @@ void loop() {
     sendTempIfNeeded(displayT);
   }
 
-  // ==== Menu & UI (ringan)
-  // tombol BACK saat layar utama -> minta password
+  // ==== Password masuk menu ====
+  // BACK pada layar utama -> minta password
   if (!inMenu && !inputPassword && !inCekSuhu && !inKalibSuhu && !inSetBatasSuhu && jState==J_IDLE && uState!=U_RUN) {
     if (BTN_BACK.fell()) {
       inputPassword = true;
       curDigit = 0;
       for (int i=0;i<4;i++) inputBuffer[i]=0;
       lcd.clear();
-      lcd.setCursor(0,0); lcd.print("Password:");
+      clearLine(0); lcd.setCursor(0,0); lcd.print("Password:");
+      clearLine(1);
       for (int i=0;i<4;i++){ lcd.setCursor(i*2,1); lcd.print(inputBuffer[i]); }
       lastBlinkTime = millis();
+      blinkState = false;
     }
   }
 
-  // Input Password
+  // ==== Input Password (fix: matikan flag saat sukses + pulihkan digit sebelum OK) ====
   if (inputPassword) {
+    // blink digit aktif
     if (millis()-lastBlinkTime >= blinkInterval) {
       lastBlinkTime = millis(); blinkState = !blinkState;
       lcd.setCursor(curDigit*2,1);
-      lcd.print(blinkState ? '_' : char('0'+inputBuffer[curDigit]));
+      if (blinkState) lcd.print('_'); else lcd.print(inputBuffer[curDigit]);
     }
+    // ubah nilai digit
     if (BTN_UP.fell())   { inputBuffer[curDigit] = (inputBuffer[curDigit]+1)%10; lcd.setCursor(curDigit*2,1); lcd.print(inputBuffer[curDigit]); }
     if (BTN_DOWN.fell()) { inputBuffer[curDigit] = (inputBuffer[curDigit]+9)%10; lcd.setCursor(curDigit*2,1); lcd.print(inputBuffer[curDigit]); }
+    // OK: pulihkan tampilan digit -> maju -> cek
     if (BTN_OK.fell()) {
+      // pulihkan digit yang sedang blink agar tidak “kosong”
+      lcd.setCursor(curDigit*2,1); lcd.print(inputBuffer[curDigit]);
       curDigit++;
       if (curDigit>3) {
         bool passOk = true; for (int i=0;i<4;i++) if (inputBuffer[i]!=password[i]) passOk=false;
-        lcd.clear(); lcd.setCursor(0,0);
+        lcd.clear();
         if (passOk) {
-          lcd.print("Password OK"); inMenu=true; curMenu=0;
-          lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]);
+          inputPassword = false;            // <-- FIX penting
+          inMenu = true; curMenu = 0;
+          clearLine(0); lcd.setCursor(0,0); lcd.print("Password OK");
+          // tampil menu awal
+          lcd.clear();
+          clearLine(0); lcd.setCursor(0,0); lcd.print(">");
+          lcd.setCursor(1,0); lcd.print(menuItems[curMenu]);
+          clearLine(1);
         } else {
-          lcd.print("Password Salah");
-          // reset input
-          for (int i=0;i<4;i++) inputBuffer[i]=0; curDigit=0;
-          lcd.clear(); lcd.setCursor(0,0); lcd.print("Password:");
+          // salah: reset input
+          for (int i=0;i<4;i++) inputBuffer[i]=0;
+          curDigit = 0; lastBlinkTime = millis(); blinkState = false;
+          lcd.clear();
+          clearLine(0); lcd.setCursor(0,0); lcd.print("Password:");
+          clearLine(1);
           for (int i=0;i<4;i++){ lcd.setCursor(i*2,1); lcd.print(inputBuffer[i]); }
-          lastBlinkTime = millis();
-          inputPassword = true; // tetap di mode input
+          // tetap di inputPassword=true
         }
       }
     }
+    // BACK: batalkan login
+    if (BTN_BACK.fell()) {
+      inputPassword = false;
+      showMessage("Batal","",400);
+    }
   }
+
+  // ==== MENU ====
   else if (inMenu) {
-    // navigasi menu
+    // navigasi menu (baris “ghost T” dicegah dengan clearLine)
     if (!inCekSuhu && !inKalibSuhu && !inSetBatasSuhu && jState==J_IDLE && uState!=U_RUN) {
-      if (BTN_UP.fell())   { curMenu = (curMenu + 7) % 8; lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); }
-      if (BTN_DOWN.fell()) { curMenu = (curMenu + 1) % 8; lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); }
+      if (BTN_UP.fell())   { curMenu = (curMenu + 7) % 8; lcd.clear(); clearLine(0); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); clearLine(1); }
+      if (BTN_DOWN.fell()) { curMenu = (curMenu + 1) % 8; lcd.clear(); clearLine(0); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); clearLine(1); }
       if (BTN_OK.fell()) {
         if (curMenu==0) { inCekSuhu = true; lcd.clear(); }
-        else if (curMenu==1){ inKalibSuhu=true; curDigit=0; lcd.clear(); lcd.setCursor(0,0); lcd.print("Kalib Suhu:"); lastBlinkTime=millis(); }
-        else if (curMenu==2){ inSetBatasSuhu=true; curDigit=0; batasBuffer[0]=batasSuhu/10; batasBuffer[1]=batasSuhu%10; lcd.clear(); lcd.setCursor(0,0); lcd.print("Set Batas Suhu:"); lastBlinkTime=millis(); }
-        else if (curMenu==3){ // Waktu (RTC) viewer
-          lcd.clear();
-          // viewer non-block: cukup tampilkan pada loop home dengan refresh cepat
-          showMessage("Mode Waktu","Tekan BACK",1200);
-        }
-        else if (curMenu==4){ // Kalib RTC: izinkan kalau tidak ada WiFi agar manual
+        else if (curMenu==1){ inKalibSuhu=true; curDigit=0; lcd.clear(); lastBlinkTime=millis(); blinkState=false; }
+        else if (curMenu==2){ inSetBatasSuhu=true; curDigit=0; batasBuffer[0]=batasSuhu/10; batasBuffer[1]=batasSuhu%10; lcd.clear(); lastBlinkTime=millis(); blinkState=false; }
+        else if (curMenu==3){ showMessage("Mode Waktu","Tekan BACK",1000); }
+        else if (curMenu==4){ // Kalib RTC manual hanya saat offline
           if (WiFi.status()!=WL_CONNECTED) {
-            // editor sederhana jam:menit:detik (bisa dikembangkan spt fungsi di atas)
             DateTime now = rtc.now();
             int jam=now.hour(), menit=now.minute(), detik=now.second();
             int cur=0; lastBlinkTime=millis(); blinkState=false;
             while (true) {
-              // nonblocking-ish kecil: keluar bila tombol BACK
-              // NB: loop pendek ini masih blocking; jika mau total non-block, pindah ke state machine seperti jadwal.
-              // Untuk singkatnya, tetap sediakan ini — tekan BACK untuk batal.
               if (millis()-lastBlinkTime>=blinkInterval){lastBlinkTime=millis();blinkState=!blinkState;}
-              lcd.setCursor(0,0); lcd.print("Kalib RTC:      ");
-              lcd.setCursor(0,1);
+              clearLine(0); lcd.setCursor(0,0); lcd.print("Kalib RTC:      ");
+              clearLine(1); lcd.setCursor(0,1);
               if (cur==0 && blinkState) lcd.print("__"); else { if (jam<10) lcd.print('0'); lcd.print(jam); }
               lcd.print(':');
               if (cur==1 && blinkState) lcd.print("__"); else { if (menit<10) lcd.print('0'); lcd.print(menit); }
@@ -655,19 +673,20 @@ void loop() {
               if (BTN_DOWN.fell()) { if(cur==0){jam=(jam+23)%24;} else if(cur==1){menit=(menit+59)%60;} else {detik=(detik+59)%60;} }
               if (BTN_OK.fell())   { cur++; if(cur>2){ rtc.adjust(DateTime(now.year(),now.month(),now.day(),jam,menit,detik)); showMessage("Simpan OK","",600); break; } }
               if (BTN_BACK.fell()) { showMessage("Batal","",400); break; }
-              tryReconnectWiFi(); tryReconnectBlynk(); // supaya tetap responsif
+              tryReconnectWiFi(); tryReconnectBlynk();
             }
           } else {
             showMessage("Terhubung WiFi","Kalib RTC manual OFF",1200);
           }
         }
         else if (curMenu==5){ startMenuSetJadwalP1(); }
-        else if (curMenu==6){ // Set Password (sederhana)
+        else if (curMenu==6){ // Set Password sederhana
           lcd.clear();
           int newPass[4]={0,0,0,0}; int p=0; lastBlinkTime=millis(); blinkState=false;
           while(true){
             if (millis()-lastBlinkTime>=blinkInterval){lastBlinkTime=millis();blinkState=!blinkState;}
-            lcd.setCursor(0,0); lcd.print("Set Password:   ");
+            clearLine(0); lcd.setCursor(0,0); lcd.print("Set Password:   ");
+            clearLine(1);
             for (int i=0;i<4;i++){ lcd.setCursor(i*2,1); if (i==p && blinkState) lcd.print('_'); else lcd.print(newPass[i]); }
             BTN_UP.update(); BTN_DOWN.update(); BTN_OK.update(); BTN_BACK.update();
             if (BTN_UP.fell())   { newPass[p]=(newPass[p]+1)%10; }
@@ -685,15 +704,12 @@ void loop() {
     // Sub-menu Cek Suhu
     if (inCekSuhu) {
       float displayT = (isnan(T) ? NAN : T + kalibSuhu);
-      lcd.setCursor(0,0); lcd.print("Suhu: ");
+      clearLine(0); lcd.setCursor(0,0); lcd.print("Suhu: ");
       if (isnan(displayT)) lcd.print("Err ");
-      else {
-        char buf[6]; dtostrf(displayT, 4,1, buf);
-        lcd.print(buf);
-      }
+      else { char buf[6]; dtostrf(displayT, 4,1, buf); lcd.print(buf); }
       lcd.print((char)223); lcd.print("C   ");
-      lcd.setCursor(0,1); lcd.print("BACK utk keluar ");
-      if (BTN_BACK.fell()) { inCekSuhu=false; lcd.clear(); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); }
+      clearLine(1); lcd.setCursor(0,1); lcd.print("BACK utk keluar ");
+      if (BTN_BACK.fell()) { inCekSuhu=false; lcd.clear(); clearLine(0); lcd.setCursor(0,0); lcd.print(">"); lcd.setCursor(1,0); lcd.print(menuItems[curMenu]); clearLine(1); }
     }
 
     // Sub-menu lain tick
@@ -702,14 +718,13 @@ void loop() {
     tickMenuSetJadwalP1();
   }
   else {
-    // Layar utama
+    // Layar utama (tanpa ghost char)
     if (!showingMsg && uState!=U_RUN && jState==J_IDLE && !inKalibSuhu && !inSetBatasSuhu && !inCekSuhu && !inputPassword) {
       if (millis()-lastHomeDraw >= 200) { lastHomeDraw = millis(); drawHome(); }
     }
   }
 
-  // Animator upload
+  // Animator upload & pesan sementara
   tickUploadAnim();
-  // Pesan sementara
   tickMessage();
 }
